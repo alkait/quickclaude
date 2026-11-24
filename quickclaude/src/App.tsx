@@ -25,7 +25,86 @@ type Msg = {
   status?: string;
   error?: string;
   meta?: string;
+  marked?: string; // "2 highlights · 1 note": what went with this follow-up, unseen
 };
+
+// A highlight in a reply: character offsets in the reply's rendered text, and an optional note.
+// Sent once with the next follow-up (⌘↩), then shown faded; leaving the chat drops them all.
+type Mark = { id: number; msg: number; start: number; end: number; quote: string; note?: string; sent: boolean };
+// What a reply paints: its marks, with the number of each note in the chat.
+type Paint = Mark & { n?: number };
+
+// Note numbers and cards are QuickClaude's own; they don't count as the reply's text.
+const ANNO = ".anno";
+
+// The reply's text from its start up to a point, skipping notes, as an offset.
+function offsetIn(root: HTMLElement, node: Node, offset: number) {
+  const r = document.createRange();
+  r.setStart(root, 0);
+  r.setEnd(node, offset);
+  const frag = r.cloneContents();
+  frag.querySelectorAll(ANNO).forEach((el) => el.remove());
+  return frag.textContent?.length ?? 0;
+}
+
+// Wrap the reply's text between two offsets in <mark>s, one per text node it crosses.
+function wrap(root: HTMLElement, start: number, end: number, make: () => HTMLElement) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) => (n.parentElement?.closest(ANNO) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+  });
+  const nodes: { node: Text; at: number }[] = [];
+  for (let at = 0, n = walker.nextNode() as Text | null; n; n = walker.nextNode() as Text | null) {
+    nodes.push({ node: n, at });
+    at += n.data.length;
+  }
+  for (const { node, at } of nodes) {
+    const a = Math.max(start - at, 0);
+    const b = Math.min(end - at, node.data.length);
+    if (a >= b || !node.data.slice(a, b).trim()) continue;
+    if (b < node.data.length) node.splitText(b);
+    const piece = a > 0 ? node.splitText(a) : node;
+    const el = make();
+    piece.replaceWith(el);
+    el.append(piece);
+  }
+}
+
+// Highlights in yellow; each note gets a number at the end of its highlight and a card
+// under the paragraph (or list, table, code block) where the highlight ends.
+function paint(root: HTMLElement, marks: Paint[]) {
+  for (const m of [...marks].sort((a, b) => a.start - b.start)) {
+    wrap(root, m.start, m.end, () => {
+      const el = document.createElement("mark");
+      el.className = m.sent ? "hl sent" : "hl";
+      el.dataset.mark = String(m.id);
+      return el;
+    });
+  }
+  const after = new Map<Element, Element>();
+  for (const m of marks.filter((m) => m.note !== undefined).sort((a, b) => a.start - b.start)) {
+    const pieces = root.querySelectorAll(`mark[data-mark="${m.id}"]`);
+    const end = pieces[pieces.length - 1];
+    if (!end) continue;
+    const ref = document.createElement("sup");
+    ref.className = "anno note-ref";
+    ref.textContent = String(m.n);
+    end.after(ref);
+    let block: Element = end;
+    while (block.parentElement && block.parentElement !== root) block = block.parentElement;
+    const card = document.createElement("div");
+    card.className = m.sent ? "anno note sent" : "anno note";
+    card.dataset.mark = String(m.id);
+    card.title = "Click to edit the note";
+    const num = document.createElement("span");
+    num.className = "note-n";
+    num.textContent = String(m.n);
+    const text = document.createElement("span");
+    text.textContent = m.note || "(empty note)";
+    card.append(num, text);
+    (after.get(block) ?? block).after(card);
+    after.set(block, card);
+  }
+}
 
 type Model = { value: string; name: string; efforts: string[] };
 type SessionRow = { id: string; title: string; at: number; pinned: number }; // pinned: when, 0 = not
@@ -67,6 +146,8 @@ const send = (cmd: object) => invoke("agent_send", { line: JSON.stringify(cmd) }
 const CONTEXT_WARN = 100_000;
 const CONTEXT_HIGH = 200_000;
 
+const count = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
 const tokens = (n: number) => (n < 1000 ? `${n}` : `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`);
 
 function ago(ms: number) {
@@ -92,20 +173,21 @@ async function prepareImage(blob: Blob): Promise<Image> {
   return { mediaType: head.slice(5, head.indexOf(";")), data, url };
 }
 
-function Markdown(props: { text: string }) {
-  return (
-    <div
-      class="md"
-      innerHTML={DOMPurify.sanitize(marked.parse(props.text, { async: false }) as string)}
-    />
-  );
+function Markdown(props: { text: string; index?: number; marks?: Paint[] }) {
+  let el!: HTMLDivElement;
+  // Rebuilt on every change; the marks are painted over the fresh HTML each time.
+  createEffect(() => {
+    el.innerHTML = DOMPurify.sanitize(marked.parse(props.text, { async: false }) as string);
+    if (props.marks?.length) paint(el, props.marks);
+  });
+  return <div ref={el} class="md" data-msg={props.index} />;
 }
 
-function AssistantBody(props: { msg: Msg }) {
+function AssistantBody(props: { msg: Msg; index?: number; marks?: Paint[] }) {
   return (
     <>
       <Show when={props.msg.text}>
-        <Markdown text={props.msg.text} />
+        <Markdown text={props.msg.text} index={props.index} marks={props.marks} />
       </Show>
       <Show when={props.msg.status}>
         <div class="status">
@@ -134,6 +216,9 @@ function UserBody(props: { msg: Msg }) {
         </div>
       </Show>
       {props.msg.text}
+      <Show when={props.msg.marked}>
+        <div class="marked-chip">{props.msg.marked}</div>
+      </Show>
     </div>
   );
 }
@@ -196,6 +281,15 @@ const KEY_SECTIONS: { title: string; rows: { keys: string[]; title: string }[] }
       { keys: ["⌘V"], title: "Paste an image" },
       { keys: ["⌫"], title: "Remove the last image (on an empty input)" },
       { keys: ["drop"], title: "Drop files to insert their paths" },
+    ],
+  },
+  {
+    title: "Highlights (select text in a reply)",
+    rows: [
+      { keys: ["h"], title: "Highlight it (again to remove)" },
+      { keys: ["n"], title: "Highlight it with a note; click a note to edit it" },
+      { keys: ["⇧C"], title: "Clear all highlights and notes" },
+      { keys: ["⌘↩"], title: "Send them with your follow-up (sent ones fade)" },
     ],
   },
   {
@@ -493,6 +587,7 @@ export default function App() {
   function openSession(row: SessionRow | undefined) {
     if (!row) return;
     turn++;
+    dropMarks();
     setOverlay("none");
     setDraft("");
     setAttachments([]);
@@ -574,6 +669,7 @@ export default function App() {
         // The open chat was the one deleted: it no longer exists to follow up on.
         if (sessionId() === ev.id) {
           turn++;
+          dropMarks();
           setTasks(0);
           setMessages([]);
           setBusy(false);
@@ -618,7 +714,9 @@ export default function App() {
   function ask(followUp: boolean) {
     const text = draft().trim();
     const images = attachments();
-    if ((!text && !images.length) || (busy() && followUp)) return;
+    // New highlights and notes go only with a follow-up; a new question drops them.
+    const unsent = followUp ? marks().filter((m) => !m.sent) : [];
+    if ((!text && !images.length && !unsent.length) || (busy() && followUp)) return;
     turn++;
     pending = "";
     if (!followUp) {
@@ -627,8 +725,18 @@ export default function App() {
       setChatTitle("");
       setTasks(0);
       setContext(null);
+      dropMarks();
     }
-    setMessages(messages.length, { role: "user", text, images: images.map((i) => i.url) });
+    const notes = unsent.filter((m) => m.note).length;
+    setMessages(messages.length, {
+      role: "user",
+      text,
+      images: images.map((i) => i.url),
+      marked: unsent.length
+        ? `${count(unsent.length, "highlight")}${notes ? ` · ${count(notes, "note")}` : ""}`
+        : undefined,
+    });
+    setMarks((ms) => ms.map((m) => (unsent.includes(m) ? { ...m, sent: true } : m)));
     setMessages(messages.length, { role: "assistant", text: "", status: "Thinking…" });
     setBusy(true);
     setNotice("");
@@ -639,6 +747,9 @@ export default function App() {
       type: "ask",
       text,
       images: images.map(({ mediaType, data }) => ({ mediaType, data })),
+      annotations: [...unsent]
+        .sort((a, b) => a.msg - b.msg || a.start - b.start)
+        .map((m) => ({ quote: m.quote, note: m.note })),
       followUp,
       turn,
       model: model(),
@@ -648,6 +759,7 @@ export default function App() {
 
   function clear() {
     turn++;
+    dropMarks();
     setTasks(0);
     setContext(null);
     setMessages([]);
@@ -709,6 +821,108 @@ export default function App() {
   }
   createEffect(on([draft, sessionId], disarmCompact, { defer: true }));
 
+  // --- highlights & notes: select text in a reply, then h, n or ⇧C ---
+  const [marks, setMarks] = createSignal<Mark[]>([]);
+  // The note being written in the input: its mark, whether n just made it, and the draft put aside.
+  const [noting, setNoting] = createSignal<{ id: number; fresh: boolean } | null>(null);
+  let noteStash = "";
+  let markSeq = 0;
+  const [markFlash, setMarkFlash] = createSignal("");
+  let markFlashTimer = 0;
+  const notingQuote = () => {
+    const q = marks().find((m) => m.id === noting()?.id)?.quote ?? "";
+    return q.length > 40 ? `${q.slice(0, 40).trimEnd()}…` : q;
+  };
+
+  // One reply's marks, each note numbered by its place in the chat.
+  function marksFor(i: number): Paint[] {
+    const all = marks();
+    const noted = all.filter((m) => m.note !== undefined).sort((a, b) => a.msg - b.msg || a.start - b.start);
+    return all.filter((m) => m.msg === i).map((m) => ({ ...m, n: noted.indexOf(m) + 1 || undefined }));
+  }
+
+  // The selection, if it lies within one reply: which reply, its offsets and the quoted text.
+  function selectionSpot() {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+    const r = sel.getRangeAt(0);
+    const host = (n: Node) => (n instanceof Element ? n : n.parentElement)?.closest<HTMLElement>(".md");
+    const root = host(r.startContainer);
+    if (!root || root !== host(r.endContainer) || root.dataset.msg === undefined) return null;
+    const clone = root.cloneNode(true) as HTMLElement;
+    clone.querySelectorAll(ANNO).forEach((el) => el.remove());
+    const text = clone.textContent ?? "";
+    let start = offsetIn(root, r.startContainer, r.startOffset);
+    let end = offsetIn(root, r.endContainer, r.endOffset);
+    while (start < end && /\s/.test(text[start])) start++;
+    while (end > start && /\s/.test(text[end - 1])) end--;
+    if (start >= end) return null;
+    return { msg: Number(root.dataset.msg), start, end, quote: text.slice(start, end) };
+  }
+
+  // h highlights the selection, or removes the highlights it touches; n adds a note
+  // (or edits the note of the highlight it touches).
+  function markSelection(withNote: boolean) {
+    const spot = selectionSpot();
+    if (!spot) return false;
+    window.getSelection()?.removeAllRanges();
+    const hit = marks().filter((m) => m.msg === spot.msg && m.start < spot.end && spot.start < m.end);
+    if (hit.length && !withNote) {
+      setMarks((ms) => ms.filter((m) => !hit.includes(m)));
+      input.focus();
+    } else if (hit.length) {
+      startNote(hit[0].id, false);
+    } else {
+      const m: Mark = { id: ++markSeq, ...spot, sent: false, note: withNote ? "" : undefined };
+      setMarks((ms) => [...ms, m]);
+      if (withNote) startNote(m.id, true);
+      else input.focus();
+    }
+    return true;
+  }
+
+  // The note is written in the input; what was typed there comes back after.
+  function startNote(id: number, fresh: boolean) {
+    if (noting()) finishNote(true);
+    noteStash = draft();
+    setNoting({ id, fresh });
+    setDraft(marks().find((m) => m.id === id)?.note ?? "");
+    input.focus();
+    queueMicrotask(autosize);
+  }
+
+  // ↩ saves (an empty note leaves a plain highlight); Esc drops a new one, or leaves an old one as it was.
+  function finishNote(save: boolean) {
+    const n = noting();
+    if (!n) return;
+    const text = draft().trim() || undefined;
+    if (save) setMarks((ms) => ms.map((m) => (m.id === n.id && m.note !== text ? { ...m, note: text, sent: false } : m)));
+    else if (n.fresh) setMarks((ms) => ms.filter((m) => m.id !== n.id));
+    setNoting(null);
+    setDraft(noteStash);
+    noteStash = "";
+    queueMicrotask(autosize);
+  }
+
+  // ⇧C: clear them all; the placeholder says how many went.
+  function clearMarks() {
+    if (noting()) finishNote(false);
+    const all = marks();
+    if (!all.length) return;
+    const notes = all.filter((m) => m.note).length;
+    setMarks([]);
+    setMarkFlash(`Cleared ${count(all.length, "highlight")}${notes ? `, ${count(notes, "note")}` : ""}`);
+    clearTimeout(markFlashTimer);
+    markFlashTimer = window.setTimeout(() => setMarkFlash(""), 1600);
+  }
+
+  // Leaving the chat drops them; they belong to it.
+  function dropMarks() {
+    setMarks([]);
+    setNoting(null);
+    noteStash = "";
+  }
+
   async function onPaste(e: ClipboardEvent) {
     const items = [...(e.clipboardData?.items ?? [])];
     const files = items.filter((i) => i.kind === "file" && i.type.startsWith("image/"));
@@ -753,6 +967,21 @@ export default function App() {
         else closeOverlay();
       }
       return;
+    }
+    if (noting()) {
+      // The input holds a note: ↩ saves it, Esc cancels; the panel's ⌘ keys still work.
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        return finishNote(true);
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        return finishNote(false);
+      }
+      if (!e.metaKey) {
+        if (e.key === "Tab" || e.key === "ArrowDown") e.preventDefault();
+        return;
+      }
     }
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
@@ -927,6 +1156,14 @@ export default function App() {
     }
     if (overlay() === "prefs") return onPrefsKey(e);
     if (overlay() === "keys") return onKeysKey(e);
+    // With text selected in a reply (focus is then off the input): h, n, and ⇧C for all.
+    if (overlay() === "none" && e.target !== input && !noting() && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if ((e.key === "h" || e.key === "n") && markSelection(e.key === "n")) return e.preventDefault();
+      if (e.key === "C" && marks().length) {
+        e.preventDefault();
+        return clearMarks();
+      }
+    }
     if (e.target === input) return;
     const panelKey = e.key === "Escape" || e.key === "Tab" || (e.metaKey && ["t", ".", "p"].includes(e.key));
     if (!panelKey) return;
@@ -984,6 +1221,9 @@ export default function App() {
 
   // Open links in the default browser instead of inside the panel.
   function onClick(e: MouseEvent) {
+    // A note card under a reply: edit its note in the input.
+    const card = (e.target as HTMLElement).closest<HTMLElement>(".note[data-mark]");
+    if (card) return startNote(Number(card.dataset.mark), false);
     const a = (e.target as HTMLElement).closest("a");
     if (a?.href) {
       e.preventDefault();
@@ -1020,6 +1260,10 @@ export default function App() {
           placeholder={
             overlay() === "history"
               ? "Search chats…"
+              : noting()
+              ? `Note on “${notingQuote()}”`
+              : markFlash()
+              ? markFlash()
               : onTopFlash()
               ? onTop()
                 ? "Keep on top: on"
@@ -1249,7 +1493,7 @@ export default function App() {
                       {messages[last() - 1]?.images?.length ? "🖼 " : ""}
                       {messages[last() - 1]?.text}
                     </div>
-                    <AssistantBody msg={lastAnswer()} />
+                    <AssistantBody msg={lastAnswer()} index={last()} marks={marksFor(last())} />
                     {waiting()}
                   </div>
                 </Show>
@@ -1286,10 +1530,10 @@ export default function App() {
           </div>
           <div class="list" ref={list}>
             <For each={messages}>
-              {(m) => (
+              {(m, i) => (
                 <div class={`msg ${m.role}`}>
                   <Show when={m.role === "assistant"} fallback={<UserBody msg={m} />}>
-                    <AssistantBody msg={m} />
+                    <AssistantBody msg={m} index={i()} marks={marksFor(i())} />
                   </Show>
                 </div>
               )}

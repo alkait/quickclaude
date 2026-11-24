@@ -2,7 +2,8 @@
 //
 // Speaks JSON lines over stdio with the Tauri shell:
 //   in:  {type:"hello"}                                  re-send models (UI reloaded)
-//        {type:"ask", text, images?, followUp, turn, model, effort}
+//        {type:"ask", text, images?, annotations?, followUp, turn, model, effort}
+//                                     annotations: [{quote, note?}] the user highlighted in replies
 //        {type:"stop"} | {type:"reset"}
 //        {type:"history"}                                list past sessions
 //        {type:"open", id, turn}                         reopen a past session
@@ -254,16 +255,34 @@ async function configure(s, model, effort) {
   }
 }
 
-function content(text, images) {
-  if (!images?.length) return text;
-  const blocks = images.map((img) => ({
+// Highlights and notes ride along as their own text block, which the chat view never shows
+// (NOISE hides it when a chat is reopened).
+function annotationBlock(annotations) {
+  if (!annotations?.length) return null;
+  const lines = annotations.map((a, i) => {
+    const quote = `${i + 1}. "${a.quote.replace(/\s+/g, " ")}"`;
+    return a.note ? `${quote}\n   Note: ${a.note}` : quote;
+  });
+  return {
+    type: "text",
+    text: `<user-annotations>\nThe user highlighted these passages in your earlier replies${
+      annotations.some((a) => a.note) ? ", some with a note" : ""
+    }. Take them into account in this reply; they aren't visible to the user as part of their message.\n${lines.join("\n")}\n</user-annotations>`,
+  };
+}
+
+function content(text, images, annotations) {
+  const note = annotationBlock(annotations);
+  if (!images?.length && !note) return text;
+  const blocks = (images ?? []).map((img) => ({
     type: "image",
     source: { type: "base64", media_type: img.mediaType, data: img.data },
   }));
+  if (note) blocks.push(note);
   return text ? [...blocks, { type: "text", text }] : blocks;
 }
 
-async function ask({ text, images, followUp, turn, model, effort }) {
+async function ask({ text, images, annotations, followUp, turn, model, effort }) {
   let s = followUp ? current : null;
   if (!s) {
     const mine = ++seq;
@@ -288,7 +307,7 @@ async function ask({ text, images, followUp, turn, model, effort }) {
   } catch (e) {
     emit({ type: "error", message: `Couldn't switch model/effort: ${e.message}` });
   }
-  s.input.push(content(text, images));
+  s.input.push(content(text, images, annotations));
 }
 
 // /compact in the same session: Claude Code swaps the history for a summary and carries on.
@@ -481,7 +500,7 @@ async function remove(id) {
 }
 
 // Claude Code stores harness notes as user messages; keep only what a person typed.
-const NOISE = /^(<command-|<local-command-|<system-reminder>|<task-notification>|Caveat: )/;
+const NOISE = /^(<command-|<local-command-|<system-reminder>|<task-notification>|<user-annotations>|Caveat: )/;
 // A compacted chat's transcript starts from this summary; the earlier messages aren't returned.
 const SUMMARY = /^This session is being continued from a previous conversation/;
 

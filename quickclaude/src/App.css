@@ -14,6 +14,9 @@
   --dot: rgba(255, 255, 255, 0.25);
   --hint: rgba(255, 255, 255, 0.33);
   --switch-off: rgba(255, 255, 255, 0.16);
+  --hl: rgba(255, 204, 0, 0.42);
+  --hl-sent: rgba(255, 204, 0, 0.16);
+  --hl-edge: #e6b800;
   /* Extra side padding that centres a reading column; non-zero only in full screen. */
   --col: 0px;
   font: 450 21px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
@@ -39,6 +42,9 @@
     --dot: rgba(0, 0, 0, 0.2);
     --hint: rgba(0, 0, 0, 0.35);
     --switch-off: rgba(0, 0, 0, 0.15);
+    --hl: rgba(255, 214, 0, 0.55);
+    --hl-sent: rgba(255, 214, 0, 0.22);
+    --hl-edge: #c99a00;
   }
 }
 
@@ -846,4 +852,75 @@ textarea::placeholder {
 .segments span.on {
   background: var(--accent);
   color: #fff;
+}
+
+/* --- highlights & notes (h, n, ⇧C on text selected in a reply) --- */
+
+.md mark.hl {
+  background: var(--hl);
+  color: inherit;
+  border-radius: 3px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  transition: background 0.3s;
+}
+
+/* Already sent with a follow-up: Claude has it, so it fades. */
+.md mark.hl.sent {
+  background: var(--hl-sent);
+}
+
+.md .note-ref {
+  color: var(--hl-edge);
+  font-size: 13px;
+  font-weight: 600;
+  margin-left: 1px;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.md .note {
+  display: flex;
+  gap: 8px;
+  margin: -4px 0 10px;
+  padding: 5px 10px;
+  border-left: 3px solid var(--hl-edge);
+  border-radius: 0 6px 6px 0;
+  background: var(--hl-sent);
+  font-size: 17px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.md .note.sent {
+  opacity: 0.65;
+}
+
+.md .note:hover {
+  opacity: 1;
+}
+
+.md .note-n {
+  color: var(--hl-edge);
+  font-weight: 600;
+}
+
+.marked-chip {
+  margin-top: 4px;
+  font-size: 15px;
+  color: var(--muted);
+}
+
+.marked-chip::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 2px;
+  background: var(--hl);
+  vertical-align: 1px;
 }
